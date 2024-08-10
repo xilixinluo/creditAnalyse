@@ -21,8 +21,10 @@ from sklearn.model_selection import KFold, cross_val_score, cross_val_predict
 from imblearn.over_sampling import SMOTE, BorderlineSMOTE
 from imblearn.pipeline import Pipeline as imbpipeline
 from lightgbm import LGBMClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, make_scorer, roc_curve
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, make_scorer, roc_curve,auc
 import datetime
+from sklearn.model_selection import GridSearchCV, KFold, cross_val_score
+from xgboost import XGBClassifier
 
 
 # from scipy.stats import chi2
@@ -648,21 +650,56 @@ def judgeModel(y_train, y_pred, X_train, model):
 
 
 
-def trainData(X,y, Classifier = RandomForestClassifier, model_name='rf'):
+
+
+
+def trainData(X,y, Classifier = RandomForestClassifier, param_grid={}, gridAdvance = False, params = {}):
+    # X = X.head(10000)
+    # y = y.head(10000)
     # 初始化模型
-    model = Classifier(random_state=42)
+    model = Classifier(random_state=42, n_estimators=100)
 
     # 使用SMOTE平衡数据
     smote = BorderlineSMOTE(random_state=42)
 
     # 定义Pipeline
     pipeline = imbpipeline(steps=[('smote', smote), ('model', model)])
-
+    
     # 执行交叉验证
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    y_pred = cross_val_predict(pipeline, X, y, cv=kf, method='predict')
-    model = pipeline.named_steps['model']
-    return [y_pred, model]
+    
+    y_pred = []
+    y_pred_proba = []
+    # 自定义评分函数，保存每个折的模型
+    def custom_scoring(estimator, X_test, y_test):
+        y_pred.append(estimator.predict(X_test))
+        # 计算AUC需要概率估计
+        y_pred_proba_c = estimator.predict_proba(X_test)[:, 1]
+        y_pred_proba.append(y_pred_proba_c)  # 获取正类的预测概率
+        # 计算ROC曲线的FPR和TPR
+        fpr, tpr, _ = roc_curve(y_test, y_pred_proba_c)
+        # KS值是TPR和FPR曲线之间的最大垂直距离
+        ks = max(x2 - x1 for x1, x2 in zip(fpr, tpr))
+        return ks
+    
+    if gridAdvance:
+        # 创建GridSearchCV实例
+        grid_search = GridSearchCV(estimator=pipeline, param_grid=param_grid, cv=kf, scoring=custom_scoring)
+
+        # 执行网格搜索
+        grid_search.fit(X, y)
+
+        # 获取最优参数
+        best_params = grid_search.best_params_
+        print(f"Best parameters: {best_params}")
+        y_pred = grid_search.predict(X)
+        y_pred_proba = grid_search.predict_proba(X)[:, 1]
+    else:
+        cross_val_score(pipeline, X, y, cv=kf, scoring=custom_scoring, params=params)
+        y_pred = np.concatenate(y_pred, axis=0)
+        y_pred_proba = np.concatenate(y_pred_proba, axis=0)
+
+    return [y, y_pred, y_pred_proba]
 
 model_feat = ['creditAge','term','installment','annualIncome','postCode','delinquency_2years','ficoRangeHigh','pubRec','n12','n14','homeOwnership_5','verificationStatus_1','verificationStatus_2','purpose_3','regionCode_50','dti','interestRate','grade','subGrade','ficoRangeLow','revolUtil','n2','n3','n9','loanAmnt_binned','openAccUtilization','initialListStatus','n0']
 # trainData(data=data_train_s[model_feat], Classifier= RandomForestClassifier, model_name='rf')
@@ -670,64 +707,80 @@ model_feat = ['creditAge','term','installment','annualIncome','postCode','delinq
 # trainData(data=data_train_s[model_feat], Classifier= lgb.LGBMClassifier, model_name='lgb')
 
 # 精确度、准确率、召回率、F1、AUC 评价
-def judgeModel(y_test, y_pred, X_test, model):
+def judgeModel(y_test, y_pred, y_pred_proba):
     accuracy = accuracy_score(y_test, y_pred)
     precision = precision_score(y_test, y_pred, average='binary')  # 对于二分类问题使用 'binary'
     recall = recall_score(y_test, y_pred, average='binary')
     f1 = f1_score(y_test, y_pred, average='binary')
-
     # 计算AUC需要概率估计
-    y_pred_proba = model.predict_proba(X_test)[:, 1]  # 获取正类的预测概率
-    auc = roc_auc_score(y_test, y_pred_proba)
-    # 计算ROC曲线的FPR和TPR
+    auc_score = roc_auc_score(y_test, y_pred_proba)
+    # 计算KS值
     fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
-    # KS值是TPR和FPR曲线之间的最大垂直距离
+    roc_auc =  auc(fpr, tpr)
     ks = max(x2 - x1 for x1, x2 in zip(fpr, tpr))
-
     # 打印性能指标
     print(f"Accuracy: {accuracy:.4f}")
     print(f"Precision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"F1 Score: {f1:.4f}")
-    print(f"AUC: {auc:.4f}")
+    print(f"AUC: {auc_score:.4f}")
     print(f"KS Value: {ks}")
 
-
+    # 绘制ROC曲线
+    plt.figure()
+    lw = 2
+    plt.plot(fpr, tpr, color='darkorange', lw=lw, label='ROC curve (area = %0.2f)' % roc_auc)
+    plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+    plt.show()
     return [
         accuracy,
         precision,
         recall,
         f1,
-        auc,
+        auc_score,
         ks
     ]
 
-models_result = {
-    'rf': [],
-    'lgb': [],
-    'gb': []
-}
+models_result_rf = []
+models_result_lgb = []
+models_result_gb = []
 
-models_result['rf'] = trainData(X=data_train_s[model_feat], y=data_train_s['isDefault'], Classifier= RandomForestClassifier, model_name='rf')
-models_result['rf'].extend(judgeModel(y=data_train_s['isDefault'], y_pred=models_result.rf.y_pred,X=data_train_s[model_feat], model=models_result['rf'][1]))
-
-
-models_result['lgb'] = trainData(X=data_train_s[model_feat], y=data_train_s['isDefault'], Classifier= LGBMClassifier, model_name='lgb')
-models_result['lgb'].extend(judgeModel(y=data_train_s['isDefault'], y_pred=models_result.lgb.y_pred,X=data_train_s[model_feat], model=models_result['lgb'][1]))
-
-
-models_result['gb']= trainData(X=data_train_s[model_feat], y=data_train_s['isDefault'], Classifier= GradientBoostingClassifier, model_name='gb')
-models_result['gb'].extend(judgeModel(y=data_train_s['isDefault'], y_pred=models_result.gb.y_pred,X=data_train_s[model_feat], model=models_result['gb'][1]))
+models_result_rf = trainData(X=data_train_s[model_feat], y=data_train_s['isDefault'], Classifier= RandomForestClassifier,
+    param_grid = {
+    'model__n_estimators': [100, 200],  # 随机森林的树的数量
+    'model__max_depth': [None, 10, 20],  # 树的最大深度
+    # 添加其他需要调优的参数
+    })
+judgeModel(*models_result_rf)
 
 
+models_result_lgb = trainData(X=data_train_s[model_feat], y=data_train_s['isDefault'], Classifier= LGBMClassifier)
+judgeModel(*models_result_lgb)
 
 
+models_result_gb= trainData(X=data_train_s[model_feat], y=data_train_s['isDefault'], Classifier= GradientBoostingClassifier)
+judgeModel(*models_result_gb)
 
-
-
-
-
-
+models_result_xgb= trainData(X=data_train_s[model_feat], y=data_test_s['isDefault'], Classifier=XGBClassifier, 
+    param_grid = {
+    'model__n_estimators': [100, 200],
+    'model__max_depth': [3, 5, 7],
+    'model__min_child_weight': [1, 5, 10],
+    'model__gamma': [0, 0.5, 1],
+    'model__subsample': [0.8, 1],
+    'model__colsample_bytree': [0.8, 1],
+    },
+    params={
+        'objective': 'binary:logistic',
+        'booster': 'gbtree'
+    })
+judgeModel(*models_result_xgb)
 
 def cv_model(clf, train_x, train_y, test_x, clf_name):
     folds = 5
